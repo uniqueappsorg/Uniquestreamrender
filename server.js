@@ -251,7 +251,7 @@ function roomDto(r) {
 }
 const memberDto = (m) => ({
   id: m.user.id, uid: m.uid, name: m.user.name, avatar: m.user.avatar || '',
-  role: m.role, muted: m.muted, hand: m.hand,
+  role: m.role, muted: m.muted, hostMuted: !!m.hostMuted, hand: m.hand,
 });
 
 // ---------------------------------------------------------------- REST
@@ -552,7 +552,7 @@ async function handleJoin(ws, msg) {
   }
   const isHost = r.host_id === ws.user.id;
   const member = existing || {
-    user: ws.user, uid: lr.nextUid++, muted: false, hand: false,
+    user: ws.user, uid: lr.nextUid++, muted: false, hostMuted: false, hand: false,
     role: isHost ? 'host' : (r.open_mic ? 'speaker' : 'listener'),
   };
   member.ws = ws;
@@ -577,10 +577,11 @@ async function handleHost(ws, msg) {
     case 'mute': case 'unmute':
       if (!target) return;
       target.muted = msg.action === 'mute';
-      broadcast(code, { t: 'member_update', id: target.user.id, muted: target.muted });
+      target.hostMuted = msg.action === 'mute';
+      broadcast(code, { t: 'member_update', id: target.user.id, muted: target.muted, hostMuted: target.hostMuted });
       break;
     case 'mute_all':
-      for (const m of lr.members.values()) if (m.role !== 'host') { m.muted = true; }
+      for (const m of lr.members.values()) if (m.role !== 'host') { m.muted = true; m.hostMuted = true; }
       broadcast(code, { t: 'mute_all' });
       break;
     case 'promote': case 'demote':
@@ -654,7 +655,7 @@ wss.on('connection', async (ws, req) => {
         }
         case 'mute_self': {
           const lr = live.get(ws.roomCode); const me = lr && lr.members.get(ws.user.id);
-          if (!me) break;
+          if (!me || me.hostMuted || (msg.muted === false && me.role === 'listener')) break;
           me.muted = !!msg.muted;
           broadcast(ws.roomCode, { t: 'member_update', id: me.user.id, muted: me.muted });
           break;
