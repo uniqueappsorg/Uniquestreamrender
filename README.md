@@ -1,11 +1,28 @@
 # UniqueStream Talk server
 
-Node 18+, Express, SQLite (better-sqlite3), Neon Postgres, WebSocket, and LiveKit token service.
+Node 22, Express, SQLite (better-sqlite3), Neon Postgres, WebSocket, and LiveKit token service.
 
 ```
 npm install
 node server.js
 ```
+## Deploy to Render
+
+Create a **Web Service** from this folder (or extract the supplied server ZIP and connect its Git
+repository). Use Node runtime, build command `npm ci`, start command `npm start`, and health check
+path `/health`. Set Node version to `22.x`. Add the following values in Render's Environment page;
+never upload `.env` or put secrets in Git:
+
+- Required: `NEON_DATABASE_URL`, `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`.
+- For Google/YouTube account linking: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`,
+  `GOOGLE_APP_REDIRECT_URI`, `YOUTUBE_TOKEN_ENCRYPTION_KEY`.
+- Optional: `MAX_VOICE_FRAME` (default `1200`), `MAX_ROOM_MEMBERS` (default `12`). Render supplies `PORT`.
+
+The app's Talk server default is `https://uniquestreamrender.onrender.com`; if the Render service has
+a different hostname, update `TalkClient.DEFAULT_SERVER_URL` in the app and rebuild, or set the same
+URL through the app's Talk server preference before connecting. The app derives `wss://.../ws` from
+that HTTPS URL for the real-time room connection.
+
 Set the variables in `.env.example` in the hosting environment (do not commit a `.env`). The supplied
 Google Web OAuth JSON may be mounted as a protected server-side file via `GOOGLE_OAUTH_CLIENT_FILE`
 (or provide its client ID/secret as environment variables); never package it in the Android app.
