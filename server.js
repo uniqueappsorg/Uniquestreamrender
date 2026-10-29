@@ -80,6 +80,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_code, id);
   userByGoogle: db.prepare('SELECT * FROM users WHERE google_sub = ?'),
   insertUser: db.prepare('INSERT INTO users (id, name, email, google_sub, avatar, created_at) VALUES (?,?,?,?,?,?)'),
   updateUser: db.prepare('UPDATE users SET name = ?, avatar = COALESCE(?, avatar), email = COALESCE(?, email) WHERE id = ?'),
+  updateProfile: db.prepare('UPDATE users SET name = ?, avatar = ? WHERE id = ?'),
   insertSession: db.prepare('INSERT INTO sessions (token, user_id, created_at) VALUES (?,?,?)'),
   sessionUser: db.prepare('SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?'),
   insertRoom: db.prepare('INSERT INTO rooms (code, name, topic, host_id, is_public, open_mic, max_members, created_at) VALUES (?,?,?,?,?,?,?,?)'),
@@ -272,6 +273,45 @@ async function auth(req, res, next) {
     res.status(503).json({ error: 'authentication service unavailable' });
   }
 }
+
+// Keep the Talk Room identity aligned with the editable in-app Google profile name.
+app.patch('/api/profile', auth, async (req, res) => {
+  try {
+    const name = clean(req.body.name, 32);
+    if (!name) return res.status(400).json({ error: 'display name required' });
+    const avatar = req.body.avatar === undefined ? (req.user.avatar || '') : clean(req.body.avatar, 512);
+    if (avatar) {
+      let parsed;
+      try { parsed = new URL(avatar); } catch (_) { return res.status(400).json({ error: 'invalid profile image URL' }); }
+      if (parsed.protocol !== 'https:' || !(parsed.hostname === 'googleusercontent.com' || parsed.hostname.endsWith('.googleusercontent.com'))) {
+        return res.status(400).json({ error: 'profile image must be served by Google' });
+      }
+    }
+    let updated;
+    if (neonSql) {
+      await neonReady;
+      updated = (await neonSql.query(
+        'UPDATE talk_users SET name=$1, avatar=$2 WHERE id=$3 RETURNING *', [name, avatar || null, req.user.id]
+      ))[0];
+    } else {
+      q.updateProfile.run(name, avatar || null, req.user.id);
+      updated = q.userById.get(req.user.id);
+    }
+    for (const client of wss.clients) {
+      if (client.user?.id === updated.id) client.user = updated;
+    }
+    for (const [code, liveRoomState] of live) {
+      const member = liveRoomState.members.get(updated.id);
+      if (!member) continue;
+      member.user = updated;
+      broadcast(code, { t: 'member_update', id: updated.id, name, avatar: updated.avatar || '' });
+    }
+    res.json({ user: publicUser(updated) });
+  } catch (error) {
+    console.error('profile update failed:', error);
+    res.status(503).json({ error: 'could not update profile name' });
+  }
+});
 
 // Production LiveKit token endpoint. API secrets never leave this backend. Tokens are short-lived
 // and publish microphone audio only; camera publishing is intentionally not granted.
