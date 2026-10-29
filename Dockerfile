@@ -8,4 +8,3 @@ ENV PORT=8080 DB_PATH=/data/talk.db
 VOLUME /data
 EXPOSE 8080
 CMD ["node", "server.js"]
-
