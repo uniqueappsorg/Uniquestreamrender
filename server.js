@@ -26,6 +26,8 @@ const PORT = parseInt(process.env.PORT || '8080', 10);
 const DB_PATH = process.env.DB_PATH || './data/talk.db';
 const MAX_VOICE_FRAME = parseInt(process.env.MAX_VOICE_FRAME || '1200', 10);
 const MAX_ROOM_MEMBERS = parseInt(process.env.MAX_ROOM_MEMBERS || '12', 10);
+const YOUTUBE_CHAT_QUOTA_BUDGET = Math.max(100, parseInt(process.env.YOUTUBE_CHAT_QUOTA_BUDGET || '4000', 10));
+const SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const NEON_DATABASE_URL = process.env.NEON_DATABASE_URL || '';
 const LIVEKIT_URL = process.env.LIVEKIT_URL || '';
 const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || '';
@@ -61,6 +63,9 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sessions (
   token TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS youtube_quota_usage (
+  quota_day TEXT PRIMARY KEY, units INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS rooms (
   code TEXT PRIMARY KEY, name TEXT NOT NULL, topic TEXT DEFAULT '', host_id TEXT NOT NULL,
   is_public INTEGER DEFAULT 1, open_mic INTEGER DEFAULT 1, locked INTEGER DEFAULT 0,
@@ -89,7 +94,10 @@ CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_code, id);
   closeRoom: db.prepare('UPDATE rooms SET closed_at = ? WHERE code = ?'),
   setLocked: db.prepare('UPDATE rooms SET locked = ? WHERE code = ?'),
   insertMsg: db.prepare('INSERT INTO messages (room_code, user_id, name, text, ts) VALUES (?,?,?,?,?)'),
-  recentMsgs: db.prepare('SELECT * FROM (SELECT * FROM messages WHERE room_code = ? ORDER BY id DESC LIMIT ?) ORDER BY id ASC'),
+    recentMsgs: db.prepare('SELECT * FROM (SELECT * FROM messages WHERE room_code = ? ORDER BY id DESC LIMIT ?) ORDER BY id ASC'),
+    quotaUsage: db.prepare('SELECT units FROM youtube_quota_usage WHERE quota_day = ?'),
+    quotaInsert: db.prepare('INSERT INTO youtube_quota_usage (quota_day, units) VALUES (?,?)'),
+    quotaUpdate: db.prepare('UPDATE youtube_quota_usage SET units = ? WHERE quota_day = ?'),
   };
 }
 
@@ -116,6 +124,9 @@ if (neonSql) {
     )`);
     await neonSql.query(`CREATE TABLE IF NOT EXISTS talk_sessions (
       token TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES talk_users(id), created_at BIGINT NOT NULL
+    )`);
+    await neonSql.query(`CREATE TABLE IF NOT EXISTS youtube_quota_usage (
+      quota_day TEXT PRIMARY KEY, units INTEGER NOT NULL
     )`);
     await neonSql.query(`CREATE TABLE IF NOT EXISTS talk_rooms (
     code TEXT PRIMARY KEY, name TEXT NOT NULL, topic TEXT NOT NULL DEFAULT '',
@@ -161,10 +172,39 @@ async function saveUser(user) {
   return q.userById.get(user.id);
 }
 async function sessionUser(token) {
+  const validAfter = now() - SESSION_MAX_AGE_MS;
   if (neonSql) { await neonReady; return (await neonSql.query(
-    'SELECT u.* FROM talk_sessions s JOIN talk_users u ON u.id=s.user_id WHERE s.token=$1', [token]
+    'SELECT u.* FROM talk_sessions s JOIN talk_users u ON u.id=s.user_id WHERE s.token=$1 AND s.created_at >= $2', [token, validAfter]
   ))[0] || null; }
-  return q.sessionUser.get(token) || null;
+  const row = q.sessionUser.get(token) || null;
+  return row && row.created_at >= validAfter ? row : null;
+}
+
+function pacificQuotaDay() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+}
+async function reserveYoutubeQuota(userId, kind) {
+  const cost = kind === 'chat_send' ? 20 : kind === 'chat_poll' ? 5 : 0;
+  if (!cost) return false;
+  const day = pacificQuotaDay();
+  if (neonSql) {
+    await neonReady;
+    const rows = await neonSql.query(
+      `INSERT INTO youtube_quota_usage (quota_day,units) VALUES ($1,$2)
+       ON CONFLICT (quota_day) DO UPDATE SET units=youtube_quota_usage.units + EXCLUDED.units
+       WHERE youtube_quota_usage.units + EXCLUDED.units <= $3 RETURNING units`,
+      [day, cost, YOUTUBE_CHAT_QUOTA_BUDGET]
+    );
+    return rows.length > 0;
+  }
+  return db.transaction(() => {
+    const row = q.quotaUsage.get(day);
+    const used = Number(row?.units || 0);
+    if (used + cost > YOUTUBE_CHAT_QUOTA_BUDGET) return false;
+    if (row) q.quotaUpdate.run(used + cost, day);
+    else q.quotaInsert.run(day, cost);
+    return true;
+  })();
 }
 
 async function roomByCode(code) {
@@ -257,8 +297,35 @@ const memberDto = (m) => ({
 
 // ---------------------------------------------------------------- REST
 const app = express();
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '32kb' }));
+const httpRateBuckets = new Map();
+function rateLimit(max, windowMs) {
+  return (req, res, next) => {
+    const key = `${req.ip || req.socket.remoteAddress}:${req.baseUrl}${req.path}`;
+    const time = now();
+    let bucket = httpRateBuckets.get(key);
+    if (!bucket || time >= bucket.until) bucket = { count: 0, until: time + windowMs };
+    bucket.count++;
+    httpRateBuckets.set(key, bucket);
+    if (bucket.count > max) return res.status(429).json({ error: 'too many requests; try again shortly' });
+    next();
+  };
+}
+app.use('/api/auth', rateLimit(30, 60_000));
 app.get('/health', (_req, res) => res.json({ ok: true, rooms: live.size, time: now() }));
+
+app.post('/api/youtube/quota/reserve', rateLimit(120, 60_000), auth, async (req, res) => {
+  try {
+    const kind = clean(req.body?.kind, 24);
+    if (kind !== 'chat_poll' && kind !== 'chat_send') return res.status(400).json({ error: 'invalid quota operation' });
+    const allowed = await reserveYoutubeQuota(req.user.id, kind);
+    res.json({ allowed, day: pacificQuotaDay(), budgetUnits: YOUTUBE_CHAT_QUOTA_BUDGET });
+  } catch (error) {
+    console.error('YouTube quota reservation failed:', error.message);
+    res.status(503).json({ error: 'quota reservation unavailable' });
+  }
+});
 
 async function auth(req, res, next) {
   const h = req.headers.authorization || '';
@@ -416,7 +483,7 @@ async function getYoutubeRefreshToken(userId) {
 }
 
 // OAuth web-server flow: refresh tokens stay server-side and are encrypted at rest.
-app.post('/api/youtube/oauth/start', auth, async (req, res) => {
+app.post('/api/youtube/oauth/start', rateLimit(10, 10 * 60_000), auth, async (req, res) => {
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI || !YOUTUBE_TOKEN_ENCRYPTION_KEY) {
     return res.status(503).json({ error: 'YouTube server OAuth is not configured' });
   }
@@ -652,8 +719,10 @@ wss.on('connection', async (ws, req) => {
   const queuedMessages = [];
   const queueMessage = (data, isBinary) => queuedMessages.push([data, isBinary]);
   ws.on('message', queueMessage);
-  const url = new URL(req.url, 'http://localhost');
-  const token = url.searchParams.get('token') || '';
+  const authorization = req.headers.authorization || '';
+  // Keep query-token auth temporarily for older installed app versions during rollout.
+  const legacyQueryToken = new URL(req.url, 'http://localhost').searchParams.get('token') || '';
+  const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : legacyQueryToken;
   let user = null;
   try { user = token ? await sessionUser(token) : null; }
   catch (e) { console.error('websocket auth lookup failed:', e); ws.close(1013, 'auth service unavailable'); return; }
@@ -661,6 +730,8 @@ wss.on('connection', async (ws, req) => {
   ws.user = user;
   ws.isAlive = true;
   ws.roomCode = null;
+  ws.chatWindowStartedAt = 0;
+  ws.chatWindowCount = 0;
   ws.on('pong', () => { ws.isAlive = true; });
 
   ws.on('message', (data, isBinary) => {
@@ -681,6 +752,16 @@ wss.on('connection', async (ws, req) => {
         return;
       }
       const msg = JSON.parse(data.toString());
+      if (msg.t === 'chat') {
+        const time = now();
+        if (time - ws.chatWindowStartedAt >= 10_000) {
+          ws.chatWindowStartedAt = time;
+          ws.chatWindowCount = 0;
+        }
+        if (++ws.chatWindowCount > 10) {
+          return send(ws, { t: 'error', code: 'rate_limited', message: 'Please slow down chat messages' });
+        }
+      }
       switch (msg.t) {
         case 'join': void handleJoin(ws, msg).catch((e) => { console.error('join failed:', e); send(ws, { t: 'error', code: 'join_failed', message: 'Could not join room' }); }); break;
         case 'leave': void leaveRoom(ws).catch((e) => console.error('leave failed:', e)); break;
@@ -726,6 +807,7 @@ wss.on('connection', async (ws, req) => {
 
 setInterval(() => {
   for (const [state, pending] of pendingYoutubeOAuth) if (pending.expiresAt < now()) pendingYoutubeOAuth.delete(state);
+  for (const [key, bucket] of httpRateBuckets) if (bucket.until < now()) httpRateBuckets.delete(key);
   for (const ws of wss.clients) {
     if (!ws.isAlive) { ws.terminate(); continue; }
     ws.isAlive = false;
