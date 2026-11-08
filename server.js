@@ -661,14 +661,20 @@ async function closeRoom(code) {
     live.delete(code);
   }
 }
-async function leaveRoom(ws) {
+async function leaveRoom(ws, explicit = false) {
   const code = ws.roomCode;
   if (!code) return;
   const lr = live.get(code);
   ws.roomCode = null;
   if (!lr) return;
   const m = lr.members.get(ws.user.id);
-  if (m && m.ws === ws) {
+  if (m && (m.ws === ws || !m.ws)) {
+    if (!explicit) {
+      // 60-second network drop grace window: do not drop member or spam leave immediately
+      m.disconnectedAt = now();
+      m.ws = null;
+      return;
+    }
     lr.members.delete(ws.user.id);
     broadcast(code, { t: 'member_leave', id: ws.user.id });
     // Keep the creator as the durable host even while temporarily disconnected. A
@@ -682,14 +688,17 @@ async function handleJoin(ws, msg) {
   const code = clean(msg.room, 8).toUpperCase();
   const r = await roomByCode(code);
   if (!r) return send(ws, { t: 'error', code: 'no_room', message: 'Room not found' });
-  await leaveRoom(ws);
   const lr = liveRoom(code);
   const existing = lr.members.get(ws.user.id);
+  const wasGraceDisconnected = !!(existing && existing.disconnectedAt);
   if (!existing) {
     if (r.locked && r.host_id !== ws.user.id) return send(ws, { t: 'error', code: 'locked', message: 'Room is locked' });
     if (lr.members.size >= r.max_members) return send(ws, { t: 'error', code: 'full', message: 'Room is full' });
   } else {
-    try { existing.ws.close(4000, 'joined elsewhere'); } catch (_) {}
+    if (existing.ws && existing.ws !== ws) {
+      try { existing.ws.close(4000, 'joined elsewhere'); } catch (_) {}
+    }
+    existing.disconnectedAt = null;
   }
   const isHost = r.host_id === ws.user.id;
   const member = existing || {
@@ -697,6 +706,7 @@ async function handleJoin(ws, msg) {
     role: isHost ? 'host' : (r.open_mic ? 'speaker' : 'listener'),
   };
   member.ws = ws;
+  member.disconnectedAt = null;
   lr.members.set(ws.user.id, member);
   ws.roomCode = code;
   const history = await listMessages(code, 30);
@@ -704,7 +714,9 @@ async function handleJoin(ws, msg) {
     t: 'joined', room: roomDto(r), you: memberDto(member),
     members: [...lr.members.values()].map(memberDto), history,
   });
-  broadcast(code, { t: 'member_join', member: memberDto(member) }, ws.user.id);
+  if (!wasGraceDisconnected) {
+    broadcast(code, { t: 'member_join', member: memberDto(member) }, ws.user.id);
+  }
 }
 
 async function handleHost(ws, msg) {
@@ -712,7 +724,8 @@ async function handleHost(ws, msg) {
   const lr = code && live.get(code);
   const r = code && await roomByCode(code);
   if (!lr || !r) return;
-  if (r.host_id !== ws.user.id) return send(ws, { t: 'error', code: 'forbidden', message: 'Host only' });
+  const isHost = r.host_id === ws.user.id || lr.members.get(ws.user.id)?.role === 'host';
+  if (!isHost) return send(ws, { t: 'error', code: 'forbidden', message: 'Host only' });
   const target = msg.target ? lr.members.get(String(msg.target)) : null;
   switch (msg.action) {
     case 'mute': case 'unmute':
@@ -733,10 +746,12 @@ async function handleHost(ws, msg) {
       break;
     case 'kick':
       if (!target || target.user.id === ws.user.id) return;
-      send(target.ws, { t: 'kicked' });
+      if (target.ws) send(target.ws, { t: 'kicked' });
       lr.members.delete(target.user.id);
       broadcast(code, { t: 'member_leave', id: target.user.id });
-      try { target.ws.close(4001, 'kicked'); } catch (_) {}
+      if (target.ws) {
+        try { target.ws.close(4001, 'kicked'); } catch (_) {}
+      }
       break;
     case 'lock': case 'unlock':
       await updateRoom(code, 'locked', msg.action === 'lock');
@@ -803,7 +818,7 @@ wss.on('connection', async (ws, req) => {
           if (ws.roomCode && live.has(ws.roomCode)) send(ws, { t: 'heartbeat_ack', ts: now() });
           break;
         case 'join': void handleJoin(ws, msg).catch((e) => { console.error('join failed:', e); send(ws, { t: 'error', code: 'join_failed', message: 'Could not join room' }); }); break;
-        case 'leave': void leaveRoom(ws).catch((e) => console.error('leave failed:', e)); break;
+        case 'leave': void leaveRoom(ws, true).catch((e) => console.error('leave failed:', e)); break;
         case 'chat': {
           const code = ws.roomCode; const text = clean(msg.text, 300);
           if (!code || !text) break;
@@ -838,8 +853,8 @@ wss.on('connection', async (ws, req) => {
     }
   });
   ws.off('message', queueMessage);
-  ws.on('close', () => { void leaveRoom(ws).catch((e) => console.error('room cleanup failed:', e)); });
-  ws.on('error', () => { void leaveRoom(ws).catch((e) => console.error('room cleanup failed:', e)); });
+  ws.on('close', () => { void leaveRoom(ws, false).catch((e) => console.error('room cleanup failed:', e)); });
+  ws.on('error', () => { void leaveRoom(ws, false).catch((e) => console.error('room cleanup failed:', e)); });
   send(ws, { t: 'hello', user: publicUser(user) });
   queuedMessages.forEach(([data, isBinary]) => ws.emit('message', data, isBinary));
 });
@@ -847,6 +862,17 @@ wss.on('connection', async (ws, req) => {
 setInterval(() => {
   for (const [state, pending] of pendingYoutubeOAuth) if (pending.expiresAt < now()) pendingYoutubeOAuth.delete(state);
   for (const [key, bucket] of httpRateBuckets) if (bucket.until < now()) httpRateBuckets.delete(key);
+  // Grace period cleanup: remove participants whose connection has been lost for > 60 seconds
+  const currentTime = now();
+  for (const [code, lr] of live.entries()) {
+    for (const [userId, m] of lr.members.entries()) {
+      if (m.disconnectedAt && (currentTime - m.disconnectedAt > 60000)) {
+        lr.members.delete(userId);
+        broadcast(code, { t: 'member_leave', id: userId });
+        if (lr.members.size === 0) { live.delete(code); }
+      }
+    }
+  }
   for (const ws of wss.clients) {
     if (!ws.isAlive) { ws.terminate(); continue; }
     ws.isAlive = false;
