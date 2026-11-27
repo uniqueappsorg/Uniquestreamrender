@@ -1,3 +1,19 @@
+/*
+ * Copyright (C) 2026 Unique Apps. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /**
  * UniqueStream Talk Room server
  * -----------------------------
@@ -27,7 +43,27 @@ const DB_PATH = process.env.DB_PATH || './data/talk.db';
 const MAX_VOICE_FRAME = parseInt(process.env.MAX_VOICE_FRAME || '1200', 10);
 const MAX_ROOM_MEMBERS = parseInt(process.env.MAX_ROOM_MEMBERS || '12', 10);
 const YOUTUBE_CHAT_QUOTA_BUDGET = Math.max(100, parseInt(process.env.YOUTUBE_CHAT_QUOTA_BUDGET || '4000', 10));
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+const DEFAULT_CONFIG = {
+  youtubeChatEnabled: true,
+  youtubeViewerStatsEnabled: true,
+  youtubeChatPollIntervalMs: 30_000,
+  youtubeViewerPollIntervalMs: 60_000,
+  youtubeChatQuotaBudget: YOUTUBE_CHAT_QUOTA_BUDGET,
+  youtubeChatPollUnits: 5,
+  youtubeChatSendUnits: 20,
+  youtubeViewerPollUnits: 1,
+  talkRoomsEnabled: true,
+  maxRoomMembers: MAX_ROOM_MEMBERS,
+  chatRateLimitCount: 10,
+  chatRateLimitWindowMs: 10_000,
+  maxVoiceFrameBytes: MAX_VOICE_FRAME,
+  disconnectGraceMs: 60_000,
+};
+let runtimeConfig = { ...DEFAULT_CONFIG };
+let runtimeConfigUpdatedAt = Date.now();
 const NEON_DATABASE_URL = process.env.NEON_DATABASE_URL || '';
 const LIVEKIT_URL = process.env.LIVEKIT_URL || '';
 const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || '';
@@ -78,6 +114,9 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE TABLE IF NOT EXISTS youtube_credentials (
   user_id TEXT PRIMARY KEY, refresh_token TEXT NOT NULL, updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS app_config (
+  key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_code, id);
   `);
   q = {
@@ -99,6 +138,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_code, id);
     quotaUsage: db.prepare('SELECT units FROM youtube_quota_usage WHERE quota_day = ?'),
     quotaInsert: db.prepare('INSERT INTO youtube_quota_usage (quota_day, units) VALUES (?,?)'),
     quotaUpdate: db.prepare('UPDATE youtube_quota_usage SET units = ? WHERE quota_day = ?'),
+    getConfig: db.prepare('SELECT value, updated_at FROM app_config WHERE key = ?'),
+    saveConfig: db.prepare('INSERT INTO app_config (key, value, updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at'),
   };
 }
 
@@ -142,7 +183,80 @@ if (neonSql) {
     await neonSql.query(`CREATE TABLE IF NOT EXISTS youtube_credentials (
       user_id TEXT PRIMARY KEY REFERENCES talk_users(id), refresh_token TEXT NOT NULL, updated_at BIGINT NOT NULL
     )`);
+    await neonSql.query(`CREATE TABLE IF NOT EXISTS app_config (
+      key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at BIGINT NOT NULL
+    )`);
   })().catch((e) => { console.error('Neon schema init failed:', e.message); throw e; });
+}
+
+function sanitizeConfig(raw) {
+  const num = (v, min, max, fallback) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.min(Math.max(Math.round(n), min), max) : fallback;
+  };
+  const bool = (v, fallback) => (typeof v === 'boolean' ? v : fallback);
+  return {
+    youtubeChatEnabled: bool(raw?.youtubeChatEnabled, runtimeConfig.youtubeChatEnabled),
+    youtubeViewerStatsEnabled: bool(raw?.youtubeViewerStatsEnabled, runtimeConfig.youtubeViewerStatsEnabled),
+    youtubeChatPollIntervalMs: num(raw?.youtubeChatPollIntervalMs, 5_000, 300_000, runtimeConfig.youtubeChatPollIntervalMs),
+    youtubeViewerPollIntervalMs: num(raw?.youtubeViewerPollIntervalMs, 10_000, 300_000, runtimeConfig.youtubeViewerPollIntervalMs),
+    youtubeChatQuotaBudget: num(raw?.youtubeChatQuotaBudget, 100, 100_000, runtimeConfig.youtubeChatQuotaBudget),
+    youtubeChatPollUnits: num(raw?.youtubeChatPollUnits, 1, 100, runtimeConfig.youtubeChatPollUnits),
+    youtubeChatSendUnits: num(raw?.youtubeChatSendUnits, 1, 200, runtimeConfig.youtubeChatSendUnits),
+    youtubeViewerPollUnits: num(raw?.youtubeViewerPollUnits, 0, 50, runtimeConfig.youtubeViewerPollUnits),
+    talkRoomsEnabled: bool(raw?.talkRoomsEnabled, runtimeConfig.talkRoomsEnabled),
+    maxRoomMembers: num(raw?.maxRoomMembers, 2, 50, runtimeConfig.maxRoomMembers),
+    chatRateLimitCount: num(raw?.chatRateLimitCount, 1, 60, runtimeConfig.chatRateLimitCount),
+    chatRateLimitWindowMs: num(raw?.chatRateLimitWindowMs, 1_000, 60_000, runtimeConfig.chatRateLimitWindowMs),
+    maxVoiceFrameBytes: num(raw?.maxVoiceFrameBytes, 256, 8192, runtimeConfig.maxVoiceFrameBytes),
+    disconnectGraceMs: num(raw?.disconnectGraceMs, 5_000, 300_000, runtimeConfig.disconnectGraceMs),
+  };
+}
+
+async function loadRuntimeConfig() {
+  try {
+    let row = null;
+    if (neonSql) {
+      await neonReady;
+      row = (await neonSql.query('SELECT value, updated_at FROM app_config WHERE key = $1', ['runtime']))[0] || null;
+    } else {
+      row = q.getConfig.get('runtime') || null;
+    }
+    if (row?.value) {
+      runtimeConfig = sanitizeConfig(JSON.parse(row.value));
+      runtimeConfigUpdatedAt = Number(row.updated_at || now());
+    }
+  } catch (e) {
+    console.warn('Could not load saved runtime config, using defaults:', e.message);
+  }
+}
+
+async function saveRuntimeConfig(nextConfig) {
+  const sanitized = sanitizeConfig(nextConfig);
+  const ts = now();
+  const json = JSON.stringify(sanitized);
+  if (neonSql) {
+    await neonReady;
+    await neonSql.query(
+      `INSERT INTO app_config (key, value, updated_at) VALUES ($1,$2,$3)
+       ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at`,
+      ['runtime', json, ts]
+    );
+  } else {
+    q.saveConfig.run('runtime', json, ts);
+  }
+  runtimeConfig = sanitized;
+  runtimeConfigUpdatedAt = ts;
+  return sanitized;
+}
+
+async function getYoutubeQuotaUsed(day = pacificQuotaDay()) {
+  if (neonSql) {
+    await neonReady;
+    const rows = await neonSql.query('SELECT units FROM youtube_quota_usage WHERE quota_day = $1', [day]);
+    return Number(rows[0]?.units || 0);
+  }
+  return Number(q.quotaUsage.get(day)?.units || 0);
 }
 
 async function userById(id) {
@@ -185,8 +299,16 @@ function pacificQuotaDay() {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 }
 async function reserveYoutubeQuota(userId, kind) {
-  const cost = kind === 'chat_send' ? 20 : kind === 'chat_poll' ? 5 : 0;
-  if (!cost) return false;
+  const cost = kind === 'chat_send'
+    ? runtimeConfig.youtubeChatSendUnits
+    : kind === 'chat_poll'
+      ? runtimeConfig.youtubeChatPollUnits
+      : kind === 'viewer_poll'
+        ? runtimeConfig.youtubeViewerPollUnits
+        : -1;
+  if (cost < 0) return false;
+  if (cost === 0) return true;
+  const budget = runtimeConfig.youtubeChatQuotaBudget;
   const day = pacificQuotaDay();
   if (neonSql) {
     await neonReady;
@@ -194,14 +316,14 @@ async function reserveYoutubeQuota(userId, kind) {
       `INSERT INTO youtube_quota_usage (quota_day,units) VALUES ($1,$2)
        ON CONFLICT (quota_day) DO UPDATE SET units=youtube_quota_usage.units + EXCLUDED.units
        WHERE youtube_quota_usage.units + EXCLUDED.units <= $3 RETURNING units`,
-      [day, cost, YOUTUBE_CHAT_QUOTA_BUDGET]
+      [day, cost, budget]
     );
     return rows.length > 0;
   }
   return db.transaction(() => {
     const row = q.quotaUsage.get(day);
     const used = Number(row?.units || 0);
-    if (used + cost > YOUTUBE_CHAT_QUOTA_BUDGET) return false;
+    if (used + cost > budget) return false;
     if (row) q.quotaUpdate.run(used + cost, day);
     else q.quotaInsert.run(day, cost);
     return true;
@@ -342,14 +464,94 @@ app.get('/health/ready', async (_req, res) => {
 app.post('/api/youtube/quota/reserve', rateLimit(120, 60_000), auth, async (req, res) => {
   try {
     const kind = clean(req.body?.kind, 24);
-    if (kind !== 'chat_poll' && kind !== 'chat_send') return res.status(400).json({ error: 'invalid quota operation' });
+    if (kind !== 'chat_poll' && kind !== 'chat_send' && kind !== 'viewer_poll') {
+      return res.status(400).json({ error: 'invalid quota operation' });
+    }
     const allowed = await reserveYoutubeQuota(req.user.id, kind);
-    res.json({ allowed, day: pacificQuotaDay(), budgetUnits: YOUTUBE_CHAT_QUOTA_BUDGET });
+    res.json({
+      allowed,
+      day: pacificQuotaDay(),
+      budgetUnits: runtimeConfig.youtubeChatQuotaBudget,
+      config: runtimeConfig,
+      updatedAt: runtimeConfigUpdatedAt,
+    });
   } catch (error) {
     console.error('YouTube quota reservation failed:', error.message);
     res.status(503).json({ error: 'quota reservation unavailable' });
   }
 });
+
+app.get('/api/config', (_req, res) => {
+  res.json({ config: runtimeConfig, updatedAt: runtimeConfigUpdatedAt });
+});
+
+function adminAuth(req, res, next) {
+  if (!ADMIN_PASSWORD) {
+    return res.status(503).json({ error: 'ADMIN_PASSWORD is not configured on the server' });
+  }
+  const h = req.headers.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : '';
+  const a = Buffer.from(token, 'utf8');
+  const b = Buffer.from(ADMIN_PASSWORD, 'utf8');
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return res.status(401).json({ error: 'invalid admin password' });
+  }
+  next();
+}
+
+app.get('/api/admin/state', rateLimit(60, 60_000), adminAuth, async (_req, res) => {
+  try {
+    const day = pacificQuotaDay();
+    const used = await getYoutubeQuotaUsed(day);
+    const rooms = [];
+    for (const [code, lr] of live.entries()) {
+      rooms.push({
+        code,
+        members: lr.members.size,
+        names: [...lr.members.values()].map((m) => m.user.name),
+      });
+    }
+    res.json({
+      config: runtimeConfig,
+      updatedAt: runtimeConfigUpdatedAt,
+      quota: { day, used, budget: runtimeConfig.youtubeChatQuotaBudget },
+      server: {
+        uptimeSec: Math.floor(process.uptime()),
+        dbMode: neonSql ? 'neon' : 'sqlite',
+        wsClients: wss.clients.size,
+        activeRooms: rooms.length,
+      },
+      rooms,
+    });
+  } catch (e) {
+    console.error('admin state failed:', e.message);
+    res.status(500).json({ error: 'could not load admin state' });
+  }
+});
+
+app.put('/api/admin/config', rateLimit(30, 60_000), adminAuth, async (req, res) => {
+  try {
+    const saved = await saveRuntimeConfig(req.body || {});
+    const payload = JSON.stringify({ t: 'config_update', config: saved, updatedAt: runtimeConfigUpdatedAt });
+    for (const client of wss.clients) {
+      if (client.readyState === 1) client.send(payload);
+    }
+    res.json({ ok: true, config: saved, updatedAt: runtimeConfigUpdatedAt });
+  } catch (e) {
+    console.error('admin config update failed:', e.message);
+    res.status(500).json({ error: 'could not save config' });
+  }
+});
+
+app.post('/api/admin/rooms/:code/close', rateLimit(30, 60_000), adminAuth, async (req, res) => {
+  const code = clean(req.params.code, 8).toUpperCase();
+  if (!code) return res.status(400).json({ error: 'room code required' });
+  await closeRoom(code);
+  res.json({ ok: true });
+});
+
+app.use('/admin', express.static(path.join(__dirname, 'admin')));
+app.get('/admin', (_req, res) => res.sendFile(path.join(__dirname, 'admin', 'index.html')));
 
 async function auth(req, res, next) {
   const h = req.headers.authorization || '';
@@ -600,11 +802,12 @@ app.get('/api/rooms/mine', auth, async (req, res) => {
 });
 
 app.post('/api/rooms', auth, async (req, res) => {
+  if (!runtimeConfig.talkRoomsEnabled) return res.status(503).json({ error: 'Talk Rooms are currently paused by admin' });
   const name = clean(req.body.name, 40) || `${req.user.name}'s room`;
   const topic = clean(req.body.topic, 80);
   const isPublic = req.body.isPublic === false ? 0 : 1;
   const openMic = req.body.openMic === false ? 0 : 1;
-  const max = Math.min(Math.max(parseInt(req.body.maxMembers || 8, 10) || 8, 2), MAX_ROOM_MEMBERS);
+  const max = Math.min(Math.max(parseInt(req.body.maxMembers || 8, 10) || 8, 2), runtimeConfig.maxRoomMembers);
   try {
     const code = await newRoomCode();
     const record = await insertRoomRecord({
@@ -685,6 +888,7 @@ async function leaveRoom(ws, explicit = false) {
 }
 
 async function handleJoin(ws, msg) {
+  if (!runtimeConfig.talkRoomsEnabled) return send(ws, { t: 'error', code: 'disabled', message: 'Talk Rooms are currently paused' });
   const code = clean(msg.room, 8).toUpperCase();
   const r = await roomByCode(code);
   if (!r) return send(ws, { t: 'error', code: 'no_room', message: 'Room not found' });
@@ -789,7 +993,7 @@ wss.on('connection', async (ws, req) => {
         // voice frame
         const code = ws.roomCode;
         const lr = code && live.get(code);
-        if (!lr || data.length > MAX_VOICE_FRAME || data.length < 4) return;
+        if (!lr || data.length > runtimeConfig.maxVoiceFrameBytes || data.length < 4) return;
         const me = lr.members.get(ws.user.id);
         if (!me || me.muted || me.role === 'listener') return;
         const out = Buffer.allocUnsafe(4 + data.length);
@@ -803,11 +1007,11 @@ wss.on('connection', async (ws, req) => {
       const msg = JSON.parse(data.toString());
       if (msg.t === 'chat') {
         const time = now();
-        if (time - ws.chatWindowStartedAt >= 10_000) {
+        if (time - ws.chatWindowStartedAt >= runtimeConfig.chatRateLimitWindowMs) {
           ws.chatWindowStartedAt = time;
           ws.chatWindowCount = 0;
         }
-        if (++ws.chatWindowCount > 10) {
+        if (++ws.chatWindowCount > runtimeConfig.chatRateLimitCount) {
           return send(ws, { t: 'error', code: 'rate_limited', message: 'Please slow down chat messages' });
         }
       }
@@ -866,7 +1070,7 @@ setInterval(() => {
   const currentTime = now();
   for (const [code, lr] of live.entries()) {
     for (const [userId, m] of lr.members.entries()) {
-      if (m.disconnectedAt && (currentTime - m.disconnectedAt > 60000)) {
+      if (m.disconnectedAt && (currentTime - m.disconnectedAt > runtimeConfig.disconnectGraceMs)) {
         lr.members.delete(userId);
         broadcast(code, { t: 'member_leave', id: userId });
         if (lr.members.size === 0) { live.delete(code); }
@@ -880,4 +1084,6 @@ setInterval(() => {
   }
 }, 25000);
 
-server.listen(PORT, () => console.log(`UniqueStream Talk server listening on :${PORT}`));
+loadRuntimeConfig().finally(() => {
+  server.listen(PORT, () => console.log(`UniqueStream Talk server listening on :${PORT}`));
+});
